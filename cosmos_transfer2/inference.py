@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -185,6 +187,8 @@ class Control2WorldInference:
     def _generate_sample(self, sample: InferenceArguments, output_dir: Path, sample_id: int = 0) -> str | None:
         log.debug(f"{sample.__class__.__name__}({sample})")
         output_path = output_dir / sample.name
+        t_sample_start = time.perf_counter()
+        output_size_mb: float | None = None
 
         assert sample.prompt is not None
         prompt: str = sample.prompt
@@ -253,6 +257,8 @@ class Control2WorldInference:
         if self.setup_args.benchmark:
             torch.cuda.synchronize()
 
+        torch.cuda.reset_peak_memory_stats()
+        t_gen_start = time.perf_counter()
         with self.benchmark_timer("generate_img2world"):
             # For distilled models, guidance is not needed (CFG is distilled into the model)
             guidance = None if self.is_distilled else sample.guidance
@@ -289,6 +295,13 @@ class Control2WorldInference:
             )
             if self.setup_args.benchmark:
                 torch.cuda.synchronize()
+
+        gen_time_s = time.perf_counter() - t_gen_start
+        vram_peak_gb = torch.cuda.max_memory_allocated() / 1e9
+        vram_reserved_gb = torch.cuda.max_memory_reserved() / 1e9
+        n_frames = output_video.shape[2]
+        height = output_video.shape[3]
+        width = output_video.shape[4]
 
         if output_video.shape[2] == 1:
             ext = "jpg"
@@ -336,11 +349,27 @@ class Control2WorldInference:
 
             # Remove batch dimension and normalize to [0, 1] range
             save_img_or_video(output_video, str(output_path), fps=fps)
+            output_size_mb = os.path.getsize(f"{output_path}.{ext}") / 1e6
             # save prompt
             prompt_save_path = f"{output_path}.txt"
             with open(prompt_save_path, "w") as f:
                 f.write(sample.prompt)
             log.success(f"Generated video saved to {output_path}.{ext}")
+
+        if is_rank0():
+            elapsed_s = time.perf_counter() - t_sample_start
+            avg_ms_per_frame = gen_time_s / max(n_frames, 1) * 1000
+            log.info("=" * 50)
+            log.info(f"SAMPLE METRICS: {sample.name}")
+            log.info(f"  Total time            : {elapsed_s:.2f}s")
+            log.info(f"  Generation time       : {gen_time_s:.2f}s")
+            log.info(f"  Avg ms / frame        : {avg_ms_per_frame:.1f}ms")
+            log.info(f"  Frames                : {n_frames} @ {fps:.1f} fps  ({width}x{height})")
+            log.info(f"  VRAM peak alloc       : {vram_peak_gb:.2f} GB")
+            log.info(f"  VRAM peak reserved    : {vram_reserved_gb:.2f} GB")
+            if output_size_mb is not None:
+                log.info(f"  Output size           : {output_size_mb:.2f} MB")
+            log.info("=" * 50)
 
         if sample_id == 0 and self.setup_args.benchmark:
             # discard first warmup sample from timing

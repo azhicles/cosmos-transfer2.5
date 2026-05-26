@@ -201,6 +201,10 @@ cython_debug/
 /outputs/
 /results/
 /tmp/
+/tictactoe_data/
+
+# Cache directories
+.cache/
 
 !assets/**/*.png
 !assets/**/*.jpg

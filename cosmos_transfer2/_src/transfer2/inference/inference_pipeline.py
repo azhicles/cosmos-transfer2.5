@@ -542,6 +542,7 @@ class ControlVideo2WorldInference:
                     guided_generation_mask, num_total_frames, num_video_frames_per_chunk
                 )
             all_chunks, time_per_chunk = [], []
+            edge_vis_aug_time_s = 0.0
             # Initialize control_video_dict to accumulate control inputs across chunks
             control_video_dict = {}
             all_control_chunks = {key: [] for key in hint_key}
@@ -618,6 +619,7 @@ class ControlVideo2WorldInference:
                     if k == "control_input_inpaint_mask":
                         data_batch["control_input_inpaint"] = cur_input_frames
                 # Otherwise, compute control inputs on-the-fly via the augmentor（applicable to edge and vis).
+                t_aug = time.perf_counter()
                 data_batch = get_augmentor_for_eval(
                     data_dict=data_batch,
                     input_keys=["input_video"],
@@ -625,6 +627,7 @@ class ControlVideo2WorldInference:
                     preset_edge_threshold=preset_edge_threshold,
                     preset_blur_strength=preset_blur_strength,
                 )
+                edge_vis_aug_time_s += time.perf_counter() - t_aug
 
                 if chunk_id == 0:
                     data_batch[NUM_CONDITIONAL_FRAMES_KEY] = 0
@@ -707,6 +710,9 @@ class ControlVideo2WorldInference:
                     prev_output = torch.cat([last_frames_uint8, blank_frames], dim=2)
                 end_time = time.perf_counter()
                 time_per_chunk.append(end_time - start_time)
+
+        if any(m in hint_key for m in ("edge", "vis")):
+            log.info(f"Edge/vis augmentor total time ({num_chunks} chunks): {edge_vis_aug_time_s:.2f}s")
 
         with _maybe_get_timer(self.benchmark_timer, "postprocessing"):
             # Concatenate all chunks along time

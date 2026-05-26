@@ -14,6 +14,9 @@
 # limitations under the License.
 
 import argparse
+import os
+import subprocess
+import tempfile
 
 import cv2
 
@@ -38,8 +41,27 @@ def ranged_int(min_val: int, max_val: int):
     return checker
 
 
+def _transcode_if_av1(path: str) -> tuple[str, bool]:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_name",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True,
+    )
+    if probe.stdout.strip().lower() != "av1":
+        return path, False
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp.close()
+    subprocess.run(
+        ["ffmpeg", "-y", "-vcodec", "libdav1d", "-i", path, "-c:v", "libx264", tmp.name],
+        check=True,
+    )
+    return tmp.name, True
+
+
 def generate_edges(in_path: str, out_path: str, bright: int = 50, contrast: float = 1.0) -> None:
-    cap = cv2.VideoCapture(in_path)
+    work_path, _is_tmp = _transcode_if_av1(in_path)
+    cap = cv2.VideoCapture(work_path)
     assert cap.isOpened(), "Could not open input video."
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -61,6 +83,8 @@ def generate_edges(in_path: str, out_path: str, bright: int = 50, contrast: floa
 
     cap.release()
     out.release()
+    if _is_tmp:
+        os.unlink(work_path)
 
 
 if __name__ == "__main__":

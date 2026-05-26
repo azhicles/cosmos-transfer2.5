@@ -705,6 +705,7 @@ def read_and_process_control_input(
             # For edge/vis: skip (computed by augmentor)
             if modality == "seg":
                 log.info(f"Computing seg masks on the fly with prompt {seg_control_prompt=}.")
+                t_seg = time.perf_counter()
                 segment = VideoSegmentationModel()
                 with tempfile.NamedTemporaryFile(suffix=".mp4") as temp_output_video:
                     segment(input_video=video_path, prompt=seg_control_prompt, output_video=temp_output_video.name)
@@ -715,7 +716,9 @@ def read_and_process_control_input(
                         s3_credential_path=s3_credential_path,
                     )
                     control_input_dict["control_input_seg"] = control_attr
+                log.info(f"Seg control generation: {time.perf_counter() - t_seg:.2f}s")
             elif modality == "depth":
+                t_depth = time.perf_counter()
                 # Load video at original resolution, compute depth, then resize
                 video_frames, _ = read_video_or_image_into_frames_BCTHW(
                     video_path,
@@ -743,6 +746,7 @@ def read_and_process_control_input(
                     )
                 else:
                     control_input_dict[control_key] = None
+                log.info(f"Depth control generation: {time.perf_counter() - t_depth:.2f}s")
 
         control_mask_path = input_control_paths.get(f"{modality}_mask")
         mask_prompt = input_control_paths.get(f"{modality}_mask_prompt")

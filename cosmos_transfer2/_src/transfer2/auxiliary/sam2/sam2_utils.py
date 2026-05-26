@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import subprocess
 import time
 
 import cv2
@@ -43,9 +44,19 @@ def write_video(frames, output_path, fps=30):
 
 
 def capture_fps(input_video_path: str):
-    cap = cv2.VideoCapture(input_video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    return fps
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            input_video_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    num, den = result.stdout.strip().split("/")
+    return float(num) / float(den)
 
 
 def video_to_frames(input_loc, output_loc):
@@ -61,32 +72,38 @@ def video_to_frames(input_loc, output_loc):
         os.mkdir(output_loc)
     except OSError:
         pass
-    # Log the time
     time_start = time.time()
-    # Start capturing the feed
-    cap = cv2.VideoCapture(input_loc)
-    # Find the number of frames
-    video_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Number of frames: {video_length}")
-    count = 0
+
+    # Detect video codec so we can choose the right decoder.
+    # OpenCV's bundled FFmpeg may fail on AV1 when hardware decoding is unavailable,
+    # so we call FFmpeg directly with an explicit software decoder for AV1.
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            input_loc,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    codec = probe.stdout.strip().lower()
+
+    cmd = ["ffmpeg", "-y"]
+    if codec == "av1":
+        cmd += ["-vcodec", "libdav1d"]
+    cmd += [
+        "-i", input_loc,
+        "-q:v", "2",
+        "-start_number", "1",
+        os.path.join(output_loc, "%05d.jpg"),
+    ]
+
     print("Converting video..\n")
-    # Start converting the video
-    while cap.isOpened():
-        # Extract the frame
-        ret, frame = cap.read()
-        if not ret:
-            break
-        # Write the results back to output location.
-        cv2.imwrite(output_loc + "/%#05d.jpg" % (count + 1), frame)
-        count = count + 1
-        # If there are no more frames left
-        if count > (video_length - 1):
-            break
-    # Log the time again
+    subprocess.run(cmd, check=True)
+
+    count = len([f for f in os.listdir(output_loc) if f.endswith(".jpg")])
     time_end = time.time()
-    # Release the feed
-    cap.release()
-    # Print stats
     print("Done extracting frames.\n%d frames extracted" % count)
     print("It took %d seconds for conversion." % (time_end - time_start))
 

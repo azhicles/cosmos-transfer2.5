@@ -26,6 +26,8 @@ Usage:
 
 import argparse
 import os
+import subprocess
+import tempfile
 
 import cv2
 import numpy as np
@@ -49,9 +51,28 @@ def parse_args():
     return parser.parse_args()
 
 
+def _transcode_if_av1(path: str) -> tuple[str, bool]:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_name",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True,
+    )
+    if probe.stdout.strip().lower() != "av1":
+        return path, False
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp.close()
+    subprocess.run(
+        ["ffmpeg", "-y", "-vcodec", "libdav1d", "-i", path, "-c:v", "libx264", tmp.name],
+        check=True,
+    )
+    return tmp.name, True
+
+
 def load_video(video_path: str) -> tuple[np.ndarray, int]:
     """Load video as numpy array [T, H, W, C] and get FPS."""
-    cap = cv2.VideoCapture(video_path)
+    work_path, _is_tmp = _transcode_if_av1(video_path)
+    cap = cv2.VideoCapture(work_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     frames = []
 
@@ -63,6 +84,8 @@ def load_video(video_path: str) -> tuple[np.ndarray, int]:
         frames.append(frame)
 
     cap.release()
+    if _is_tmp:
+        os.unlink(work_path)
     return np.array(frames), fps
 
 

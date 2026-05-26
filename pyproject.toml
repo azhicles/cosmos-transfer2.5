@@ -46,6 +46,7 @@ dependencies = [
   "sam2>=1.1.0",
   "shapely>=2.0.5",
   "video-depth-anything @ git+https://github.com/jeanachoi/Video-Depth-Anything.git",
+  "datasets>=4.8.5",
 ]
 
 [project.optional-dependencies]

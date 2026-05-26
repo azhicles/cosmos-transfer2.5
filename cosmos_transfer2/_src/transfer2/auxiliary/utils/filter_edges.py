@@ -14,6 +14,9 @@
 # limitations under the License.
 
 import argparse
+import os
+import subprocess
+import tempfile
 
 import cv2
 import numpy as np
@@ -106,11 +109,31 @@ def apply_mask(
     return out_bgr, out_rgba
 
 
+def _transcode_if_av1(path: str) -> tuple[str, bool]:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_name",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True,
+    )
+    if probe.stdout.strip().lower() != "av1":
+        return path, False
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp.close()
+    subprocess.run(
+        ["ffmpeg", "-y", "-vcodec", "libdav1d", "-i", path, "-c:v", "libx264", tmp.name],
+        check=True,
+    )
+    return tmp.name, True
+
+
 def filter_out_edges(
     edges_p: str, mask_p: str, out_p: str, threshold: int = 0, grow_px: int = 0, close_px: int = 0, feather_px: int = 0
 ) -> None:
-    edge_cap = cv2.VideoCapture(str(edges_p))
-    mask_cap = cv2.VideoCapture(str(mask_p))
+    edges_work, edges_is_tmp = _transcode_if_av1(str(edges_p))
+    mask_work, mask_is_tmp = _transcode_if_av1(str(mask_p))
+    edge_cap = cv2.VideoCapture(edges_work)
+    mask_cap = cv2.VideoCapture(mask_work)
 
     if not edge_cap.isOpened():
         raise RuntimeError(f"Failed to open edge video: {edges_p}")
@@ -150,6 +173,10 @@ def filter_out_edges(
     edge_cap.release()
     mask_cap.release()
     writer.release()
+    if edges_is_tmp:
+        os.unlink(edges_work)
+    if mask_is_tmp:
+        os.unlink(mask_work)
 
 
 if __name__ == "__main__":
