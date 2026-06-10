@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# View -> camera-perspective phrase map for the Cosmos Transfer API.
+#
+# The phrase for the requested view is injected at the front of the assembled prompt so the
+# model renders the correct camera perspective. Override/extend by mounting your own YAML and
+# setting COSMOS_API_VIEWS_FILE, or pass an inline `view_hint` in the request.
+#
+# An unknown view name produces no hint and logs a warning.
+
+views:
+  wrist: "Egocentric close-up wrist-mounted camera view of a robot gripper manipulating objects."
+  top: "Top-down overhead camera view looking straight down at the workspace."
+  front: "Front-facing third-person camera view of the workspace."
+  side: "Side profile camera view of the workspace."
+  default: ""

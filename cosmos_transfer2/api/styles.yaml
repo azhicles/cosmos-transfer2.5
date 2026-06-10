@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Default style library for the Cosmos Transfer API.
+#
+# Intent: DOMAIN RANDOMIZATION for robot training data. Each style is a photorealistic
+# appearance variation (lighting / surface / material / time-of-day / sensor look) that keeps
+# the scene realistic while changing colour and texture, so the generated frames remain useful
+# as augmented training data.
+#
+# Each entry:
+#   suffix          (required) text appended to the (optionally upsampled) action prompt.
+#   negative_prompt (optional) overrides the request/model negative prompt for this style.
+#   overrides       (optional) per-style generation params:
+#                     guidance, sigma_max, seed, num_steps,
+#                     control_weights: {edge: 0.9, depth: 0.5, ...}
+#
+# Override or extend this file by mounting your own YAML and pointing COSMOS_API_STYLES_FILE
+# at it, or pass inline style objects in the request.
+
+styles:
+  warm_indoor:
+    suffix: >-
+      Warm tungsten indoor lighting with a soft golden tint, gentle directional shadows,
+      cozy ambient fill. Photorealistic.
+
+  cool_daylight:
+    suffix: >-
+      Bright cool daylight streaming through a window, slightly bluish white balance,
+      crisp shadows, clean neutral surfaces. Photorealistic.
+
+  dim_evening:
+    suffix: >-
+      Dim low-key evening lighting, muted desaturated colours, deep soft shadows,
+      a single warm lamp as the key light. Photorealistic.
+
+  bright_overhead:
+    suffix: >-
+      Bright even overhead fluorescent lighting, minimal shadows, high-key flat illumination,
+      clinical and uniform. Photorealistic.
+
+  wooden_table:
+    suffix: >-
+      The work surface is warm natural wood with visible grain; surroundings in earthy brown
+      tones, soft diffuse lighting. Photorealistic.
+
+  white_lab:
+    suffix: >-
+      A clean white laboratory bench with matte light-grey surroundings, neutral balanced
+      lighting, subtle soft shadows. Photorealistic.
+
+  metallic_surface:
+    suffix: >-
+      A brushed stainless-steel work surface with cool grey reflections and faint specular
+      highlights, industrial neutral lighting. Photorealistic.
+
+  overcast_window:
+    suffix: >-
+      Soft flat overcast daylight from a large window, gentle low-contrast shadows,
+      slightly muted natural colours. Photorealistic.
+
+  tungsten_lamp:
+    suffix: >-
+      Strong warm tungsten desk-lamp key light from one side, amber highlights and long
+      directional shadows, darker background. Photorealistic.
+
+  outdoor_shade:
+    suffix: >-
+      Cool open-shade outdoor lighting, soft bluish ambient fill, natural muted colours,
+      gentle diffuse shadows. Photorealistic.

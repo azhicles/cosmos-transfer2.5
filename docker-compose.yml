@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Cosmos Transfer API service.
+#
+# Prerequisite: build the base image once (see Dockerfile.api header), e.g.
+#   docker build -f docker/nightly.Dockerfile --build-arg STANDALONE=true -t cosmos-transfer2:base .
+#
+# Then:
+#   export HF_TOKEN=hf_...            # required: gated checkpoint download
+#   export ANTHROPIC_API_KEY=sk-...  # optional: only needed for prompt upsampling
+#   docker compose up --build
+#
+# The API listens on http://localhost:8000 (see API_GUIDE.md).
+
+services:
+  cosmos-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+      args:
+        BASE_IMAGE: ${COSMOS_BASE_IMAGE:-cosmos-transfer2:base}
+    image: cosmos-transfer2-api
+    ports:
+      - "${COSMOS_API_PORT:-8000}:8000"
+    # Parallel torchrun / dataloaders need ample shared memory.
+    ipc: host
+    environment:
+      # Hugging Face (gated checkpoints auto-download into the mounted cache).
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HOME: /root/.cache/huggingface
+      # Prompt upsampling (optional).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      COSMOS_API_UPSAMPLE_MODEL: ${COSMOS_API_UPSAMPLE_MODEL:-claude-haiku-4-5}
+      # Server tunables.
+      COSMOS_API_OUTPUT_DIR: /workspace/outputs/api
+      COSMOS_API_PRELOAD: ${COSMOS_API_PRELOAD:-edge}   # control set to preload at startup; "none" to skip
+      COSMOS_API_LOG_LEVEL: ${COSMOS_API_LOG_LEVEL:-INFO}
+      # Optional: point at a mounted styles/views YAML to override the bundled defaults.
+      COSMOS_API_STYLES_FILE: ${COSMOS_API_STYLES_FILE:-}
+      COSMOS_API_VIEWS_FILE: ${COSMOS_API_VIEWS_FILE:-}
+    volumes:
+      # Persist the HF checkpoint cache so models aren't re-downloaded on every restart.
+      - hf-cache:/root/.cache
+      # Generated videos + per-job logs/manifests.
+      - ./outputs/api:/workspace/outputs/api
+      # Optional: a host directory of input videos referenced via video_path.
+      - ./inputs:/workspace/inputs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:
