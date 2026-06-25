@@ -359,17 +359,24 @@ class Control2WorldInference:
         if is_rank0():
             elapsed_s = time.perf_counter() - t_sample_start
             avg_ms_per_frame = gen_time_s / max(n_frames, 1) * 1000
-            log.info("=" * 50)
-            log.info(f"SAMPLE METRICS: {sample.name}")
-            log.info(f"  Total time            : {elapsed_s:.2f}s")
-            log.info(f"  Generation time       : {gen_time_s:.2f}s")
-            log.info(f"  Avg ms / frame        : {avg_ms_per_frame:.1f}ms")
-            log.info(f"  Frames                : {n_frames} @ {fps:.1f} fps  ({width}x{height})")
-            log.info(f"  VRAM peak alloc       : {vram_peak_gb:.2f} GB")
-            log.info(f"  VRAM peak reserved    : {vram_reserved_gb:.2f} GB")
+            metric_lines = [
+                "=" * 50,
+                f"SAMPLE METRICS: {sample.name}",
+                f"  Total time            : {elapsed_s:.2f}s",
+                f"  Generation time       : {gen_time_s:.2f}s",
+                f"  Avg ms / frame        : {avg_ms_per_frame:.1f}ms",
+                f"  Frames                : {n_frames} @ {fps:.1f} fps  ({width}x{height})",
+                f"  VRAM peak alloc       : {vram_peak_gb:.2f} GB",
+                f"  VRAM peak reserved    : {vram_reserved_gb:.2f} GB",
+            ]
             if output_size_mb is not None:
-                log.info(f"  Output size           : {output_size_mb:.2f} MB")
-            log.info("=" * 50)
+                metric_lines.append(f"  Output size           : {output_size_mb:.2f} MB")
+            metric_lines.append("=" * 50)
+            for line in metric_lines:
+                log.info(line)
+            metrics_log_path = output_dir / "metrics.log"
+            with open(metrics_log_path, "a") as f:
+                f.write("\n".join(metric_lines) + "\n")
 
         if sample_id == 0 and self.setup_args.benchmark:
             # discard first warmup sample from timing

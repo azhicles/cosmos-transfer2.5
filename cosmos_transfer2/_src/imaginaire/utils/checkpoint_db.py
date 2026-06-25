@@ -158,13 +158,28 @@ def _hf_download(cmd_args: list[str]) -> str:
     """
     cmd = [
         "uvx",
+        "--with", "click",
         f"hf>={_MINIMUM_HF_CLI_VERSION}",
         "download",
         *cmd_args,
     ]
     log.info(f"{shlex.join(cmd)}")
-    subprocess.check_call(cmd, text=True)
-    return subprocess.check_output([*cmd, "--quiet"], text=True, env=dict(os.environ) | {"HF_HUB_OFFLINE": "1"}).strip()
+    # Some hf CLI versions (huggingface_hub + typer) exit with code 1 even on success due to
+    # an unhandled click.exceptions.Exit(0). Use run() and validate the output instead.
+    subprocess.run(cmd, text=True)
+    result = subprocess.run(
+        [*cmd, "--quiet"],
+        text=True,
+        capture_output=True,
+        env=dict(os.environ) | {"HF_HUB_OFFLINE": "1"},
+    )
+    path = result.stdout.strip()
+    if not path or not os.path.exists(path):
+        raise RuntimeError(
+            f"hf download failed to resolve a valid path.\n"
+            f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+        )
+    return path
 
 
 class _CheckpointHf(_CheckpointUri, ABC):
