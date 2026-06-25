@@ -100,21 +100,32 @@ def submit_and_wait(
     api_url: str,
     payload: dict,
     *,
-    upload_file: str | None = None,
+    endpoint: str = "/generate",
+    uploads: dict[str, str] | None = None,
     poll_interval_s: float = POLL_INTERVAL_S,
     timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> dict:
-    """Submit a job, poll until terminal, and return the final job status dict."""
+    """Submit a job, poll until terminal, and return the final job status dict.
+
+    ``uploads`` maps multipart field name -> local file path (e.g. {"video": ...} for
+    /generate, or {"top": ..., "wrist": ...} for /generate/dual_view). If None, posts JSON.
+    """
     api_url = api_url.rstrip("/")
-    if upload_file:
-        with open(upload_file, "rb") as f:
-            resp = requests.post(
-                f"{api_url}/generate",
-                files={"video": (Path(upload_file).name, f, "video/mp4")},
-                data={"request": json.dumps(payload)},
-            )
-    else:
-        resp = requests.post(f"{api_url}/generate", json=payload)
+    url = f"{api_url}{endpoint}"
+    handles = []
+    try:
+        if uploads:
+            files = {}
+            for field, path in uploads.items():
+                fh = open(path, "rb")
+                handles.append(fh)
+                files[field] = (Path(path).name, fh, "video/mp4")
+            resp = requests.post(url, files=files, data={"request": json.dumps(payload)})
+        else:
+            resp = requests.post(url, json=payload)
+    finally:
+        for fh in handles:
+            fh.close()
     resp.raise_for_status()
     job_id = resp.json()["job_id"]
     print(f"[cosmos] submitted job {job_id}")
@@ -208,7 +219,8 @@ def run_cosmos_transfer_step(
         except Exception as e:  # ClearML optional; never block the step on it
             print(f"[cosmos] ClearML not active ({e}); proceeding without logging.")
 
-    status = submit_and_wait(api_url, payload, upload_file=upload_file, timeout_s=timeout_s)
+    uploads = {"video": upload_file} if upload_file else None
+    status = submit_and_wait(api_url, payload, uploads=uploads, timeout_s=timeout_s)
     files = download_results(api_url, status["id"], out_dir)
     videos = [p for p in files if p.suffix == ".mp4"]
     manifest = {}
@@ -227,15 +239,109 @@ def run_cosmos_transfer_step(
     return {"job_id": status["id"], "status": status, "videos": videos, "manifest": manifest}
 
 
+def run_cosmos_transfer_dual_view_step(
+    api_url: str,
+    prompt: str,
+    out_dir: str,
+    *,
+    top_path: str | None = None,
+    wrist_path: str | None = None,
+    top_url: str | None = None,
+    wrist_url: str | None = None,
+    top_upload: str | None = None,
+    wrist_upload: str | None = None,
+    stack: str = "vstack",
+    view: str | None = None,
+    styles: list | None = None,
+    num_samples: int | None = None,
+    num_steps: int | None = None,
+    guidance: int | None = None,
+    seed: int | None = None,
+    control_preset: str | None = None,
+    controls: dict | None = None,
+    guided_generation: bool = False,
+    upsample: bool = False,
+    use_clearml: bool = True,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> dict:
+    """Restyle top+wrist of one episode together (style-consistent) via /generate/dual_view.
+
+    Provide each view as a server path, a URL, or a local file to upload. Returns
+    ``{"job_id", "status", "videos": [paths], "manifest": {...}}`` (videos include per-view files).
+    """
+    payload: dict = {"prompt": prompt, "stack": stack}
+    if top_path:
+        payload["top_path"] = top_path
+    if wrist_path:
+        payload["wrist_path"] = wrist_path
+    if top_url:
+        payload["top_url"] = top_url
+    if wrist_url:
+        payload["wrist_url"] = wrist_url
+    for k, v in (
+        ("view", view), ("styles", styles), ("num_samples", num_samples),
+        ("num_steps", num_steps), ("guidance", guidance), ("seed", seed),
+        ("control_preset", control_preset), ("controls", controls),
+    ):
+        if v is not None:
+            payload[k] = v
+    if guided_generation:
+        payload["guided_generation"] = True
+    if upsample:
+        payload["upsample"] = True
+
+    task = None
+    if use_clearml:
+        try:
+            from clearml import Task
+
+            task = Task.current_task()
+            if task is not None:
+                task.connect(payload, name="cosmos_transfer_dual_view_request")
+        except Exception as e:
+            print(f"[cosmos] ClearML not active ({e}); proceeding without logging.")
+
+    uploads = None
+    if top_upload and wrist_upload:
+        uploads = {"top": top_upload, "wrist": wrist_upload}
+    status = submit_and_wait(
+        api_url, payload, endpoint="/generate/dual_view", uploads=uploads, timeout_s=timeout_s
+    )
+    files = download_results(api_url, status["id"], out_dir)
+    videos = [p for p in files if p.suffix == ".mp4"]
+    manifest = {}
+    manifest_file = next((p for p in files if p.name == "manifest.json"), None)
+    if manifest_file is not None:
+        manifest = json.loads(manifest_file.read_text())
+
+    if task is not None:
+        try:
+            for v in videos:
+                task.upload_artifact(name=v.stem, artifact_object=str(v))
+            task.connect(manifest, name="cosmos_transfer_dual_view_manifest")
+        except Exception as e:
+            print(f"[cosmos] artifact logging failed ({e}).")
+
+    return {"job_id": status["id"], "status": status, "videos": videos, "manifest": manifest}
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--api-url", required=True, help="Base URL of the Cosmos Transfer API.")
     p.add_argument("--prompt", required=True, help="Action prompt for the original video.")
     p.add_argument("--out-dir", required=True, help="Local directory to download results into.")
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--video-path", help="Path the API server can read directly.")
-    src.add_argument("--video-url", help="URL the API server downloads from.")
-    src.add_argument("--upload", help="Local file to upload to the API (multipart).")
+    src = p.add_mutually_exclusive_group(required=False)
+    src.add_argument("--video-path", help="Single-view: path the API server can read directly.")
+    src.add_argument("--video-url", help="Single-view: URL the API server downloads from.")
+    src.add_argument("--upload", help="Single-view: local file to upload to the API (multipart).")
+    p.add_argument("--dual-view", action="store_true", help="Use /generate/dual_view (top+wrist).")
+    p.add_argument("--top-path", default=None)
+    p.add_argument("--wrist-path", default=None)
+    p.add_argument("--top-url", default=None)
+    p.add_argument("--wrist-url", default=None)
+    p.add_argument("--stack", default="vstack", choices=["vstack", "hstack"])
+    p.add_argument("--control-preset", default=None, choices=["multicontrol_robot", "edge"])
+    p.add_argument("--guided-generation", action="store_true")
     p.add_argument("--view", default=None)
     p.add_argument("--styles", default=None, help="Comma-separated style names.")
     p.add_argument("--num-samples", type=int, default=None)
@@ -253,24 +359,28 @@ def main() -> None:
     a = _parse_args()
     styles = [s.strip() for s in a.styles.split(",")] if a.styles else None
     controls = json.loads(a.controls) if a.controls else None
-    result = run_cosmos_transfer_step(
-        api_url=a.api_url,
-        prompt=a.prompt,
-        out_dir=a.out_dir,
-        video_path=a.video_path,
-        video_url=a.video_url,
-        upload_file=a.upload,
-        view=a.view,
-        styles=styles,
-        num_samples=a.num_samples,
-        num_steps=a.num_steps,
-        guidance=a.guidance,
-        seed=a.seed,
-        controls=controls,
-        upsample=a.upsample,
-        use_clearml=not a.no_clearml,
-        timeout_s=a.timeout,
-    )
+    if a.dual_view:
+        result = run_cosmos_transfer_dual_view_step(
+            api_url=a.api_url, prompt=a.prompt, out_dir=a.out_dir,
+            top_path=a.top_path, wrist_path=a.wrist_path,
+            top_url=a.top_url, wrist_url=a.wrist_url, stack=a.stack,
+            view=a.view, styles=styles, num_samples=a.num_samples,
+            num_steps=a.num_steps, guidance=a.guidance, seed=a.seed,
+            control_preset=a.control_preset, controls=controls,
+            guided_generation=a.guided_generation, upsample=a.upsample,
+            use_clearml=not a.no_clearml, timeout_s=a.timeout,
+        )
+    else:
+        if not (a.video_path or a.video_url or a.upload):
+            raise SystemExit("single-view requires one of --video-path/--video-url/--upload (or use --dual-view)")
+        result = run_cosmos_transfer_step(
+            api_url=a.api_url, prompt=a.prompt, out_dir=a.out_dir,
+            video_path=a.video_path, video_url=a.video_url, upload_file=a.upload,
+            view=a.view, styles=styles, num_samples=a.num_samples,
+            num_steps=a.num_steps, guidance=a.guidance, seed=a.seed,
+            controls=controls, upsample=a.upsample,
+            use_clearml=not a.no_clearml, timeout_s=a.timeout,
+        )
     print(json.dumps({"job_id": result["job_id"], "videos": [str(v) for v in result["videos"]]}, indent=2))
 
 

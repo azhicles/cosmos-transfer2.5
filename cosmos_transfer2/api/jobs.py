@@ -45,8 +45,8 @@ class JobManager:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.engine = InferenceEngine(work_dir)
         self._jobs: dict[str, JobStatus] = {}
-        self._requests: dict[str, GenerateRequest] = {}
-        self._videos: dict[str, Path] = {}
+        # payload: {"req": GenerateRequest, "kind": "single"|"dual", "videos": dict[str, Path]}
+        self._payloads: dict[str, dict] = {}
         self._cancelled: set[str] = set()
         self._lock = threading.Lock()
         self._queue: "queue.Queue[str]" = queue.Queue()
@@ -74,16 +74,24 @@ class JobManager:
     # --- submission ---------------------------------------------------------------
 
     def submit(self, req: GenerateRequest, input_video: Path) -> JobStatus:
+        """Queue a single-view job."""
+        return self._enqueue(req, {"kind": "single", "videos": {"input": input_video}})
+
+    def submit_dual(self, req: GenerateRequest, top_video: Path, wrist_video: Path) -> JobStatus:
+        """Queue a dual-view (top+wrist) job."""
+        return self._enqueue(req, {"kind": "dual", "videos": {"top": top_video, "wrist": wrist_video}})
+
+    def _enqueue(self, req: GenerateRequest, payload: dict) -> JobStatus:
         job_id = uuid.uuid4().hex[:12]
         status = JobStatus(id=job_id, state=JobState.QUEUED, created_at=time.time())
+        payload["req"] = req
         with self._lock:
             self._jobs[job_id] = status
-            self._requests[job_id] = req
-            self._videos[job_id] = input_video
+            self._payloads[job_id] = payload
             status.queue_position = self._queue.qsize()
         self._queue.put(job_id)
         self._persist(job_id)
-        log.info("Queued job %s (position %s).", job_id, status.queue_position)
+        log.info("Queued %s job %s (position %s).", payload["kind"], job_id, status.queue_position)
         return self._snapshot(job_id)
 
     def cancel(self, job_id: str) -> bool:
@@ -166,8 +174,10 @@ class JobManager:
                 log.info("Skipping cancelled job %s.", job_id)
                 return
             status = self._jobs[job_id]
-            req = self._requests[job_id]
-            video = self._videos[job_id]
+            payload = self._payloads[job_id]
+            req = payload["req"]
+            kind = payload["kind"]
+            videos = payload["videos"]
             status.state = JobState.RUNNING
             status.started_at = time.time()
             status.queue_position = None
@@ -176,10 +186,13 @@ class JobManager:
         d = self.job_dir(job_id)
         d.mkdir(parents=True, exist_ok=True)
         with job_log_file(d / "job.log"):
-            log.info("=== Job %s started ===", job_id)
+            log.info("=== Job %s started (%s) ===", job_id, kind)
             log.info("Request: %s", req.model_dump_json(exclude_none=True))
             try:
-                result = self.engine.run_job(req, video, d)
+                if kind == "dual":
+                    result = self.engine.run_dual_view_job(req, videos["top"], videos["wrist"], d)
+                else:
+                    result = self.engine.run_job(req, videos["input"], d)
                 with self._lock:
                     status = self._jobs[job_id]
                     status.state = JobState.SUCCEEDED
@@ -198,6 +211,6 @@ class JobManager:
                     status.finished_at = time.time()
                     status.error = f"{type(e).__name__}: {e}"
             finally:
-                # free the (potentially large) input-video handle reference
-                self._videos.pop(job_id, None)
+                # free the (potentially large) input-video handle references
+                self._payloads.pop(job_id, None)
         self._persist(job_id)

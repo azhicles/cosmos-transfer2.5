@@ -35,6 +35,31 @@ CONTROL_KEYS = ["edge", "vis", "depth", "seg"]
 ControlKey = Literal["edge", "vis", "depth", "seg"]
 Threshold = Literal["very_low", "low", "medium", "high", "very_high"]
 
+# Named control recipes. `multicontrol_robot` mirrors NVIDIA's
+# assets/robot_example/multicontrol/robot_multicontrol_spec.json — depth+seg dominate so the
+# 3D geometry and semantic regions of the action are preserved (far fewer hallucinations than
+# edge-only), while edge/vis add light structure/colour anchoring.
+ControlPreset = Literal["balanced", "multicontrol_robot", "edge"]
+
+CONTROL_PRESETS: dict[str, dict[str, dict]] = {
+    # `balanced` is the default — matches the validated production recipe (job 74c): depth+seg+edge
+    # with NO vis, for strong restyle while preserving structure/geometry.
+    "balanced": {
+        "depth": {"control_weight": 1.0},
+        "seg": {"control_weight": 1.0},
+        "edge": {"control_weight": 0.2},
+    },
+    "multicontrol_robot": {
+        "depth": {"control_weight": 1.0},
+        "seg": {"control_weight": 1.0},
+        "edge": {"control_weight": 0.2},
+        "vis": {"control_weight": 0.5, "preset_blur_strength": "high"},
+    },
+    "edge": {
+        "edge": {"control_weight": 1.0},
+    },
+}
+
 
 class JobState(str, enum.Enum):
     QUEUED = "queued"
@@ -112,8 +137,8 @@ class GenerateRequest(pydantic.BaseModel):
     """Number of appearance variations to generate."""
     seed: int = 2025
     """Base seed. Per-sample seed = seed + sample_index (a style may override its own seed)."""
-    num_steps: int = pydantic.Field(35, ge=1, le=100)
-    guidance: int = pydantic.Field(3, ge=0, le=7)
+    num_steps: int = pydantic.Field(15, ge=1, le=100)
+    guidance: int = pydantic.Field(5, ge=0, le=7)
     negative_prompt: Optional[str] = None
     """Request-level negative prompt. If None, the model default is used."""
 
@@ -127,18 +152,32 @@ class GenerateRequest(pydantic.BaseModel):
     """Inline camera-perspective phrase; overrides the resolved view hint."""
 
     # --- Controls ---
+    control_preset: ControlPreset = "balanced"
+    """Named control recipe used when ``controls`` is not given. Default 'balanced'
+    (depth 1.0 + seg 1.0 + edge 0.2, no vis) — matches the validated production recipe (job 74c)."""
     controls: Optional[dict[ControlKey, ControlSpec]] = None
-    """Control configuration. Defaults to edge-only at weight 1.0. Provide multiple keys for
-    multicontrol (loads the heavier multibranch checkpoint)."""
+    """Explicit control configuration. If provided, overrides ``control_preset``."""
 
     # --- Advanced video / quality ---
     resolution: str = "720"
-    sigma_max: Optional[str] = None
-    """0-200: how much noise is added to the input. Higher = more freedom from the input."""
+    sigma_max: Optional[str] = "110"
+    """0-200: how much noise is added to the input. Higher = more freedom from the input (more
+    restyle, more hallucination); lower = closer to the input structure. This is the main
+    fidelity↔freedom knob — prefer tuning it over lowering ``guidance``."""
     num_video_frames_per_chunk: int = pydantic.Field(93, ge=1)
     max_frames: Optional[int] = pydantic.Field(None, ge=1)
     """Read only the first N frames of the input. None = entire video (output matches input length)."""
     keep_input_resolution: bool = True
+
+    # --- Guided generation (foreground anchoring; opt-in) ---
+    guided_generation: bool = False
+    """When true, anchor a foreground region (e.g. the robot arm) so its geometry/identity is
+    preserved while the rest of the scene is restyled. The mask is auto-generated via SAM2 from
+    ``guided_foreground_prompt``."""
+    guided_foreground_prompt: Optional[str] = None
+    """Object(s) to anchor when guided_generation is on. Defaults to a robot-arm prompt."""
+    guided_generation_step_threshold: int = 25
+    """Diffusion steps over which the foreground anchor is applied (higher = stronger anchoring)."""
 
     # --- Prompt upsampling (off-GPU, optional) ---
     upsample: bool = False
@@ -159,6 +198,29 @@ class GenerateRequest(pydantic.BaseModel):
             return len(self.styles)
         return self.num_samples
 
+    def effective_controls(self) -> dict[str, ControlSpec]:
+        """Explicit ``controls`` if given, else the selected ``control_preset`` expanded."""
+        if self.controls:
+            return dict(self.controls)
+        return {k: ControlSpec(**v) for k, v in CONTROL_PRESETS[self.control_preset].items()}
+
+
+class DualViewRequest(GenerateRequest):
+    """POST /generate/dual_view: restyle a top and wrist view of the SAME episode together.
+
+    Both views are stacked into one video and restyled in a single diffusion pass per style
+    (one seed), then split back — guaranteeing the two views share style/colour/lighting. All the
+    GenerateRequest fields apply (styles, control_preset, sigma_max, guided_generation, ...).
+    The single-view ``video_path``/``video_url`` are unused here.
+    """
+
+    top_path: Optional[str] = None
+    top_url: Optional[str] = None
+    wrist_path: Optional[str] = None
+    wrist_url: Optional[str] = None
+    stack: Literal["vstack", "hstack"] = "vstack"
+    """vstack = top above wrist (640x960, VRAM-safe). hstack = side by side (more tokens)."""
+
 
 class SampleResult(pydantic.BaseModel):
     index: int
@@ -167,7 +229,9 @@ class SampleResult(pydantic.BaseModel):
     negative_prompt: Optional[str] = None
     seed: int
     output_file: Optional[str] = None
-    """Basename of the generated mp4 within the job directory."""
+    """Basename of the generated mp4 within the job directory (single-view jobs)."""
+    view_outputs: dict[str, str] = pydantic.Field(default_factory=dict)
+    """For dual-view jobs: {"top": "<file>.mp4", "wrist": "<file>.mp4"}."""
     control_files: dict[str, str] = pydantic.Field(default_factory=dict)
     generation_time_s: Optional[float] = None
 

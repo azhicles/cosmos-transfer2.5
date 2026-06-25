@@ -36,6 +36,7 @@ from pathlib import Path
 
 from cosmos_transfer2.api.config_models import (
     CONTROL_KEYS,
+    DualViewRequest,
     GenerateRequest,
     SampleResult,
     StyleEntry,
@@ -43,7 +44,10 @@ from cosmos_transfer2.api.config_models import (
 from cosmos_transfer2.api.prompts import assemble_prompt
 from cosmos_transfer2.api.styles import resolve_styles
 from cosmos_transfer2.api.upsampler import get_upsampler
+from cosmos_transfer2.api.video_ops import create_combined_video, split_combined_video
 from cosmos_transfer2.api.views import resolve_view_hint
+
+DEFAULT_GUIDED_FOREGROUND_PROMPT = "robotic arm and gripper"
 
 log = logging.getLogger("cosmos_api")
 
@@ -153,9 +157,7 @@ class InferenceEngine:
 
     @staticmethod
     def _active_control_keys(req: GenerateRequest) -> list[str]:
-        if not req.controls:
-            return ["edge"]
-        return _sorted_control_keys(list(req.controls.keys()))
+        return _sorted_control_keys(list(req.effective_controls().keys()))
 
     def _build_control_dict(
         self,
@@ -164,17 +166,17 @@ class InferenceEngine:
         control_paths: dict[str, str] | None,
     ) -> dict[str, dict]:
         """Build the per-control sub-dicts for one sample's InferenceArguments."""
-        keys = self._active_control_keys(req)
+        effective = req.effective_controls()
+        keys = _sorted_control_keys(list(effective.keys()))
         weight_overrides = (style.overrides.control_weights if style.overrides else None) or {}
         out: dict[str, dict] = {}
         for key in keys:
-            spec = req.controls[key] if req.controls and key in req.controls else None
+            spec = effective[key]
             cfg: dict = {}
-            if spec is not None:
-                for field in _CONTROL_PASSTHROUGH[key]:
-                    val = getattr(spec, field, None)
-                    if val is not None:
-                        cfg[field] = val
+            for field in _CONTROL_PASSTHROUGH[key]:
+                val = getattr(spec, field, None)
+                if val is not None:
+                    cfg[field] = val
             cfg.setdefault("control_weight", 1.0)
             if key in weight_overrides:
                 cfg["control_weight"] = weight_overrides[key]
@@ -192,6 +194,7 @@ class InferenceEngine:
         resolved_prompt: str,
         seed: int,
         control_paths: dict[str, str] | None,
+        guided_mask_path: str | None,
     ) -> dict:
         sample: dict = {
             "name": f"sample_{index:02d}_{_safe_slug(style.name)}",
@@ -214,23 +217,61 @@ class InferenceEngine:
         if negative is not None:
             sample["negative_prompt"] = negative
 
+        if guided_mask_path is not None:
+            sample["guided_generation_mask"] = guided_mask_path
+            sample["guided_generation_step_threshold"] = req.guided_generation_step_threshold
+
         sample.update(self._build_control_dict(req, style, control_paths))
         return sample
 
+    def _maybe_guided_mask(self, req: GenerateRequest, input_video: Path, job_dir: Path) -> str | None:
+        """Auto-generate a binary foreground mask via SAM2 when guided generation is requested.
+
+        Depends only on the input video + foreground prompt, so it is generated once per job and
+        reused across all styles. Returns the mask path, or None (best-effort; never blocks)."""
+        if not req.guided_generation:
+            return None
+        prompt = req.guided_foreground_prompt or DEFAULT_GUIDED_FOREGROUND_PROMPT
+        log.info("Guided generation: building foreground mask via SAM2 for prompt %r", prompt)
+        try:
+            from cosmos_transfer2._src.transfer2.inference.utils import (
+                generate_control_weight_mask_from_prompt,
+            )
+
+            mask = generate_control_weight_mask_from_prompt(
+                video_path=str(input_video.resolve()),
+                prompt=prompt,
+                output_folder=str(job_dir),
+                modality="guided",
+            )
+        except Exception as e:
+            log.warning("Guided mask generation failed (%s); proceeding without guided generation.", e)
+            return None
+        if mask is None:
+            log.warning("Guided generation: no mask produced for %r; proceeding without it.", prompt)
+        else:
+            log.info("Guided generation mask: %s", mask)
+        return mask
+
     # --- run a job ----------------------------------------------------------------
 
-    def run_job(self, req: GenerateRequest, input_video: Path, job_dir: Path) -> dict:
-        """Generate all variations for one request.
+    def _generate_styles(
+        self,
+        req: GenerateRequest,
+        input_video: Path,
+        job_dir: Path,
+        stack: str | None = None,
+    ) -> dict:
+        """Core per-style generation loop, shared by single-view and dual-view jobs.
 
-        Returns a dict with keys: ``base_prompt``, ``upsampled_prompt``, ``controls``,
-        ``samples`` (list[SampleResult]). Writes the videos, control videos, sidecars,
-        ``manifest.json`` and ``metrics.log`` into ``job_dir``.
+        ``stack`` is None for single-view; for dual-view it is "vstack"/"hstack" and each output
+        is split back into per-view files. The control video (and guided mask) are generated once
+        on ``input_video`` and reused across all styles.
         """
         from cosmos_transfer2.config import InferenceArguments
 
         job_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Resolve styles / view / prompt.
         styles_path = os.environ.get("COSMOS_API_STYLES_FILE")
         views_path = os.environ.get("COSMOS_API_VIEWS_FILE")
         styles = resolve_styles(req.styles, req.resolved_num_samples(), styles_path)
@@ -248,11 +289,12 @@ class InferenceEngine:
         effective_base = upsampled_prompt or base_prompt
 
         control_keys = self._active_control_keys(req)
-        log.info("Active controls: %s", control_keys)
+        log.info("Active controls: %s (preset=%s)", control_keys, req.control_preset)
         self.ensure_loaded(control_keys, req.disable_guardrails)
         assert self._inference is not None
 
-        # 2. Generate sample 0 (control generated on-the-fly), then reuse the control for the rest.
+        guided_mask = self._maybe_guided_mask(req, input_video, job_dir)
+
         results: list[SampleResult] = []
         control_paths: dict[str, str] = {}
 
@@ -264,7 +306,7 @@ class InferenceEngine:
             )
             prompt = assemble_prompt(view_hint, effective_base, style.suffix)
             sample_dict = self._build_sample_dict(
-                req, style, index, input_video, prompt, seed, reuse
+                req, style, index, input_video, prompt, seed, reuse, guided_mask
             )
             sample = InferenceArguments.model_validate(sample_dict)
             log.info("[%d/%d] style=%s seed=%d", index + 1, len(styles), style.name, seed)
@@ -279,6 +321,15 @@ class InferenceEngine:
                 ctrl = job_dir / f"{name}_control_{key}.mp4"
                 if ctrl.exists():
                     ctrl_files[key] = ctrl.name
+
+            view_outputs: dict[str, str] = {}
+            if stack is not None and out_mp4.exists():
+                top_out = job_dir / f"{name}_top.mp4"
+                wrist_out = job_dir / f"{name}_wrist.mp4"
+                split_combined_video(out_mp4, top_out, wrist_out, stack)  # type: ignore[arg-type]
+                view_outputs = {"top": top_out.name, "wrist": wrist_out.name}
+                log.info("Split %s -> %s, %s", out_mp4.name, top_out.name, wrist_out.name)
+
             return SampleResult(
                 index=index,
                 style=style.name,
@@ -286,13 +337,13 @@ class InferenceEngine:
                 negative_prompt=sample_dict.get("negative_prompt"),
                 seed=seed,
                 output_file=out_mp4.name if out_mp4.exists() else None,
+                view_outputs=view_outputs,
                 control_files=ctrl_files,
                 generation_time_s=round(gen_s, 2),
             )
 
-        # Sample 0
-        first = _gen_one(0, styles[0], None)
-        results.append(first)
+        # Sample 0 generates the control on-the-fly; reuse it for the rest.
+        results.append(_gen_one(0, styles[0], None))
         first_name = f"sample_00_{_safe_slug(styles[0].name)}"
         for key in control_keys:
             ctrl = job_dir / f"{first_name}_control_{key}.mp4"
@@ -300,17 +351,16 @@ class InferenceEngine:
                 control_paths[key] = str(ctrl.resolve())
         if control_paths:
             log.info("Reusing control video(s) %s for remaining samples.", list(control_paths))
-
-        # Samples 1..N-1, reusing the control video(s).
         for i in range(1, len(styles)):
             results.append(_gen_one(i, styles[i], control_paths or None))
 
-        # 3. Manifest.
         manifest = {
             "request": req.model_dump(exclude_none=True),
             "base_prompt": base_prompt,
             "upsampled_prompt": upsampled_prompt,
             "controls": control_keys,
+            "guided_generation": bool(guided_mask),
+            "stack": stack,
             "samples": [r.model_dump() for r in results],
         }
         (job_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -322,3 +372,21 @@ class InferenceEngine:
             "controls": control_keys,
             "samples": results,
         }
+
+    def run_job(self, req: GenerateRequest, input_video: Path, job_dir: Path) -> dict:
+        """Generate all style variations for a single-view request."""
+        return self._generate_styles(req, input_video, job_dir, stack=None)
+
+    def run_dual_view_job(
+        self, req: DualViewRequest, top_video: Path, wrist_video: Path, job_dir: Path
+    ) -> dict:
+        """Generate style variations for top+wrist together: stack -> one pass per style -> split.
+
+        Because both views ride one diffusion trajectory per style, the resulting ``*_top.mp4``
+        and ``*_wrist.mp4`` are frame-locked in style/colour/lighting.
+        """
+        job_dir.mkdir(parents=True, exist_ok=True)
+        combined = job_dir / "combined_input.mp4"
+        log.info("Dual-view: %s top+wrist into %s", req.stack, combined.name)
+        create_combined_video(top_video, wrist_video, combined, req.stack)
+        return self._generate_styles(req, combined, job_dir, stack=req.stack)

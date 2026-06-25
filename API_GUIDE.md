@@ -113,7 +113,8 @@ Check it's up: `curl localhost:8000/healthz`.
 | `GET` | `/healthz` | Liveness + whether the model is loaded and which control set. |
 | `GET` | `/styles` | The bundled style library. |
 | `GET` | `/views` | The bundled view → perspective-phrase map. |
-| `POST` | `/generate` | Submit a job (JSON or multipart). Returns `{job_id, state, queue_position}`. |
+| `POST` | `/generate` | Submit a single-view job (JSON or multipart). Returns `{job_id, state, queue_position}`. |
+| `POST` | `/generate/dual_view` | Restyle a top+wrist pair **consistently** (see [Cross-view consistency](#cross-view-consistency--quality)). |
 | `GET` | `/jobs` | List all jobs. |
 | `GET` | `/jobs/{id}` | Job status (incl. per-sample results, `log_tail`). |
 | `DELETE` | `/jobs/{id}` | Cancel a **queued** job (running jobs can't be preempted). |
@@ -141,12 +142,16 @@ All fields except `prompt` (and an input source) are optional; defaults shown.
 | `view` | string | — | View name resolved against `views.yaml`. |
 | `view_hint` | string | — | Inline perspective phrase; overrides `view`. |
 | `seed` | int | `2025` | Base seed; per-sample seed = `seed + index`. |
-| `num_steps` | int | `35` | Diffusion steps. |
-| `guidance` | int (0–7) | `3` | Prompt adherence. |
+| `num_steps` | int | `15` | Diffusion steps. |
+| `guidance` | int (0–7) | `5` | Prompt adherence. |
 | `negative_prompt` | string | model default | Request-level negative prompt. |
-| `controls` | object | `{"edge": {"control_weight": 1.0}}` | Control config (see [below](#controls)). |
+| `control_preset` | string | `"balanced"` | Named control recipe used when `controls` is omitted: `balanced` (depth 1.0 + seg 1.0 + edge 0.2, no vis — the validated production recipe), `multicontrol_robot` (adds vis 0.5), or `edge`. |
+| `controls` | object | (from preset) | Explicit per-control config; overrides `control_preset` (see [below](#controls)). |
+| `guided_generation` | bool | `false` | Anchor a foreground region (robot arm) while restyling the rest (see [Cross-view consistency & quality](#cross-view-consistency--quality)). |
+| `guided_foreground_prompt` | string | `"robotic arm and gripper"` | What to anchor when `guided_generation` is on (mask auto-built via SAM2). |
+| `guided_generation_step_threshold` | int | `25` | Higher = stronger foreground anchoring. |
 | `resolution` | string | `"720"` | e.g. `"720"`, `"480"`. |
-| `sigma_max` | string | — | 0–200; how much input noise (higher = more freedom from input). |
+| `sigma_max` | string | `"110"` | 0–200; how much input noise (higher = more freedom/restyle + more hallucination; lower = closer to input). The main fidelity↔freedom knob — prefer over lowering `guidance`. |
 | `num_video_frames_per_chunk` | int | `93` | Chunk size for long-video generation. |
 | `max_frames` | int | — | Read only first N frames; omit to use the whole video (output matches input length). |
 | `keep_input_resolution` | bool | `true` | Resize output back to the input resolution. |
@@ -220,6 +225,41 @@ curl -X POST localhost:8000/generate -H 'content-type: application/json' -d '{
 ```
 
 ---
+
+## Cross-view consistency & quality
+
+**Top↔wrist consistency.** Restyling each view as a separate job lets the two views drift apart
+(different colours/lighting) because each is an independent diffusion run. Use
+`POST /generate/dual_view` instead: it stacks the episode's top+wrist into one video, runs **one
+diffusion pass per style with one seed**, then splits the output back into `*_top.mp4` /
+`*_wrist.mp4`. Both views ride the same latent trajectory, so they're frame-locked in
+style/colour/lighting. Bonus: at vstack 640×960 this is the same latent-token count (and time) as
+a single view, so it also covers both views in one pass instead of two.
+
+```bash
+# JSON, server-side paths:
+curl -s -X POST localhost:8000/generate/dual_view -H 'content-type: application/json' -d '{
+  "prompt": "A robot arm places a game piece on the board.",
+  "view": "top",
+  "top_path": "/workspace/inputs/ep0_top.mp4",
+  "wrist_path": "/workspace/inputs/ep0_wrist.mp4",
+  "num_samples": 4
+}'
+# multipart upload: -F top=@ep0_top.mp4 -F wrist=@ep0_wrist.mp4 -F request='{...}'
+# download a specific view+sample: GET /jobs/{id}/results/{index}?view=top   (or grab the zip)
+```
+
+**Reducing hallucinations.** Levers, in order of impact:
+1. **Controls** — the default `control_preset: "balanced"` (depth 1.0 + seg 1.0 + edge 0.2, no vis)
+   constrains 3D geometry and semantic regions, so the model invents far less than edge-only. Use
+   `multicontrol_robot` (adds vis 0.5) to further stabilise the foreground at the cost of weaker restyle.
+2. **`sigma_max`** — the real fidelity↔freedom knob (default `"110"`). Lower (e.g. 70) hews closer
+   to the input → fewer hallucinations but less restyle; raise it for more dramatic restyling.
+3. **`guided_generation: true`** — anchors the robot arm (foreground) while the background/lighting
+   is restyled; purpose-built for domain randomization. The mask is auto-generated via SAM2 from
+   `guided_foreground_prompt`.
+4. **`guidance`** — keep it moderate (default 5). Lowering it does **not** fix hallucinations; it
+   just makes the restyle hew closer to the original. Use controls + `sigma_max` instead.
 
 ## Styles
 
@@ -296,6 +336,10 @@ python scripts/clearml_step.py --api-url http://localhost:8000 \
   --video-path /data/ep0.mp4 --prompt "A robot arm places a piece." \
   --view wrist --styles warm_indoor,cool_daylight --out-dir ./cosmos_out
 ```
+
+For consistent top+wrist pairs, use `run_cosmos_transfer_dual_view_step(api_url, prompt, out_dir,
+top_path=..., wrist_path=..., styles=[...])` (hits `/generate/dual_view`), or the CLI
+`--dual-view --top-path ... --wrist-path ...`.
 
 It submits, polls, downloads the zip, extracts the videos, and (when a ClearML `Task` is active)
 uploads them as artifacts and logs the request + manifest. It does **not** import

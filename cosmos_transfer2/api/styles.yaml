@@ -36,8 +36,14 @@ styles:
 
   bright_overhead:
     suffix: >-
-      Bright even overhead fluorescent lighting, minimal shadows, high-key flat illumination,
-      clinical and uniform. Photorealistic.
+      Bright, even, neutral-white overhead lighting with soft minimal shadows; cleanly and
+      evenly lit with natural, true-to-life colours. Photorealistic.
+    negative_prompt: >-
+      glowing or emissive game pieces, neon glow, metallic glare, colour cast, tinted hue,
+      oversaturated colours, flickering or warping background, inconsistent background,
+      cartoonish, low quality, blurry
+    overrides:
+      sigma_max: "95"
 
   wooden_table:
     suffix: >-

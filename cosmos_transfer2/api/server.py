@@ -36,6 +36,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from cosmos_transfer2.api.config_models import (
+    DualViewRequest,
     GenerateRequest,
     GenerateResponse,
     JobState,
@@ -95,20 +96,21 @@ def _download_url(url: str) -> Path:
     return dest
 
 
-def _resolve_input(req: GenerateRequest, upload: tuple[str, bytes] | None) -> Path:
+def _resolve_one(label: str, upload: tuple[str, bytes] | None, path: str | None, url: str | None) -> Path:
+    """Resolve one input video from an upload, a server path, or a URL (in that order)."""
     if upload is not None:
         return _save_upload(upload[0], upload[1])
-    if req.video_path:
-        p = Path(req.video_path).expanduser()
+    if path:
+        p = Path(path).expanduser()
         if not p.is_file():
-            raise HTTPException(400, f"video_path not found on server: {p}")
+            raise HTTPException(400, f"{label} path not found on server: {p}")
         return p.resolve()
-    if req.video_url:
+    if url:
         try:
-            return _download_url(req.video_url)
+            return _download_url(url)
         except Exception as e:
-            raise HTTPException(400, f"failed to download video_url: {e}")
-    raise HTTPException(400, "provide one of: file upload, video_path, or video_url")
+            raise HTTPException(400, f"failed to download {label} url: {e}")
+    raise HTTPException(400, f"provide an input for '{label}': file upload, path, or url")
 
 
 def _job_or_404(job_id: str) -> JobStatus:
@@ -167,8 +169,42 @@ async def generate(request: Request) -> GenerateResponse:
     except pydantic.ValidationError as e:
         raise HTTPException(422, json.loads(e.json()))
 
-    input_video = _resolve_input(req, upload)
+    input_video = _resolve_one("video", upload, req.video_path, req.video_url)
     status = manager.submit(req, input_video)
+    return GenerateResponse(job_id=status.id, state=status.state, queue_position=status.queue_position)
+
+
+@app.post("/generate/dual_view", response_model=GenerateResponse)
+async def generate_dual_view(request: Request) -> GenerateResponse:
+    """Restyle a top + wrist view of one episode together (stacked, single pass per style, split
+    back) so the two views are style-consistent. Accepts JSON (with top_path/top_url and
+    wrist_path/wrist_url) or multipart/form-data (``top`` and ``wrist`` files + a ``request`` JSON
+    field)."""
+    content_type = request.headers.get("content-type", "")
+    top_upload: tuple[str, bytes] | None = None
+    wrist_upload: tuple[str, bytes] | None = None
+
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        raw = form.get("request")
+        payload = json.loads(raw) if raw else {}
+        top = form.get("top")
+        wrist = form.get("wrist")
+        if top is not None and hasattr(top, "read"):
+            top_upload = (getattr(top, "filename", "top.mp4"), await top.read())
+        if wrist is not None and hasattr(wrist, "read"):
+            wrist_upload = (getattr(wrist, "filename", "wrist.mp4"), await wrist.read())
+    else:
+        payload = await request.json()
+
+    try:
+        req = DualViewRequest.model_validate(payload)
+    except pydantic.ValidationError as e:
+        raise HTTPException(422, json.loads(e.json()))
+
+    top_video = _resolve_one("top", top_upload, req.top_path, req.top_url)
+    wrist_video = _resolve_one("wrist", wrist_upload, req.wrist_path, req.wrist_url)
+    status = manager.submit_dual(req, top_video, wrist_video)
     return GenerateResponse(job_id=status.id, state=status.state, queue_position=status.queue_position)
 
 
@@ -201,10 +237,14 @@ def download_results(job_id: str):
     tmp = Path(tempfile.gettempdir()) / f"{job_id}_results.zip"
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
         for sample in status.samples:
-            if sample.output_file:
-                f = job_dir / sample.output_file
+            # Dual-view: ship the per-view files; single-view: the one output file.
+            names = list(sample.view_outputs.values()) if sample.view_outputs else (
+                [sample.output_file] if sample.output_file else []
+            )
+            for name in names:
+                f = job_dir / name
                 if f.is_file():
-                    zf.write(f, sample.output_file)
+                    zf.write(f, name)
         manifest = job_dir / "manifest.json"
         if manifest.is_file():
             zf.write(manifest, "manifest.json")
@@ -212,15 +252,25 @@ def download_results(job_id: str):
 
 
 @app.get("/jobs/{job_id}/results/{index}")
-def download_one(job_id: str, index: int):
-    """Download a single output video by sample index."""
+def download_one(job_id: str, index: int, view: str | None = None):
+    """Download a single output video by sample index. For dual-view jobs pass ?view=top|wrist."""
     status = _job_or_404(job_id)
     if status.state != JobState.SUCCEEDED:
         raise HTTPException(409, f"job not finished (state={status.state.value})")
     match = next((s for s in status.samples if s.index == index), None)
-    if match is None or not match.output_file:
+    if match is None:
+        raise HTTPException(404, f"no sample with index {index}")
+    if view is not None:
+        name = match.view_outputs.get(view)
+        if not name:
+            raise HTTPException(404, f"no '{view}' output for sample {index} (have: {list(match.view_outputs)})")
+    elif match.view_outputs:
+        raise HTTPException(400, f"dual-view sample; specify ?view= one of {list(match.view_outputs)}")
+    else:
+        name = match.output_file
+    if not name:
         raise HTTPException(404, f"no output for sample index {index}")
-    f = manager.job_dir(job_id) / match.output_file
+    f = manager.job_dir(job_id) / name
     if not f.is_file():
-        raise HTTPException(404, f"output file missing on disk: {match.output_file}")
-    return FileResponse(f, media_type="video/mp4", filename=match.output_file)
+        raise HTTPException(404, f"output file missing on disk: {name}")
+    return FileResponse(f, media_type="video/mp4", filename=name)
