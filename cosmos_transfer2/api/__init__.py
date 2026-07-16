@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HTTP API wrapping Cosmos Transfer 2.5 for video appearance/style variation.
+"""In-process Cosmos Transfer 2.5 engine library for video appearance/style variation.
 
-Designed to run as a long-lived service (the model loads once) and be called as a
-ClearML pipeline step. See ``API_GUIDE.md`` at the repository root for usage.
+Provides ``InferenceEngine`` (loads the checkpoint once, generates N domain-randomization
+style variations from one control pass) plus the request schema and style/view libraries. It is
+called in-process — there is no HTTP server — and driven by the ClearML Task in
+``scripts/clearml_task.py``. See ``ENGINE_GUIDE.md`` at the repository root for usage.
 """
 
 __all__ = ["__version__"]

@@ -27,7 +27,7 @@ Thin public layer — what you edit/import:
 - `inference.py` — single-view `Control2WorldInference` (load checkpoint → apply controls → generate).
 - `config.py` — Pydantic args (`SetupArguments`, `InferenceArguments`) and `CONTROL_KEYS = ["edge", "vis", "depth", "seg"]`.
 - `multiview.py` / `plenoptic.py` / `robot_multiview.py` — 7-camera, novel-view, and Agibot robot variants (+ their `*_config.py`).
-- `api/` — FastAPI service. `gradio/` — UI workers. `experiments/` — project-specific code (e.g. tictactoe).
+- `api/` — in-process restyling engine library (`InferenceEngine`, request schema, styles/views). `gradio/` — UI workers. `experiments/` — project-specific code (e.g. tictactoe).
 
 `cosmos_transfer2/_src/` — vendored engine (`imaginaire/`, `transfer2/`, `transfer2_multiview/`, …). Treat as a dependency.
 
@@ -51,18 +51,19 @@ The `<spec.json>` follows the Pydantic schema in `config.py`: `prompt`, `video_p
 
 Single control → lighter checkpoint. Multiple controls ("multicontrol") → heavier multi-branch checkpoint, auto-selected.
 
-## HTTP API (`cosmos_transfer2/api/`)
+## Restyling engine (`cosmos_transfer2/api/`)
 
-FastAPI service for domain-randomized restyling (N style variations from one control pass).
+In-process engine for domain-randomized restyling (N style variations from one control pass). No HTTP server — called directly and driven by a ClearML Task.
 
-- Run: `docker compose up --build`, or `uv run --no-sync uvicorn cosmos_transfer2.api.server:app --host 0.0.0.0 --port 8000`.
-- Key endpoints: `POST /generate`, `POST /generate/dual_view`, `GET /jobs/{id}`, `GET /jobs/{id}/results`.
-- Env: `HF_TOKEN` (required), `ANTHROPIC_API_KEY` (optional — prompt upsampling via Claude).
-- **See `API_GUIDE.md` for the full request schema, control presets, and all env vars** — don't duplicate or guess them here.
+- `engine.py` — `InferenceEngine(work_dir)`; `run_job(req, input_video, job_dir)` / `run_dual_view_job(...)`. Loads the checkpoint once and reuses it; generates the control video once and reuses it across styles.
+- `config_models.py` — `GenerateRequest` / `DualViewRequest` schema + `CONTROL_PRESETS` (balanced/multicontrol_robot/edge). `styles.yaml` / `views.yaml` — style suffixes and camera-view hints.
+- Run: `uv run --no-sync python scripts/clearml_task.py` — a batch-first ClearML Task (list of episodes, model loads once) tracked in the ClearML GUI.
+- Env: `HF_TOKEN` (only if checkpoints aren't cached), `ANTHROPIC_API_KEY` (optional — prompt upsampling via Claude).
+- **See `ENGINE_GUIDE.md` for the full request schema, control presets, and all env vars** — don't duplicate or guess them here.
 
 ## Output conventions (`outputs/`)
 
-- API jobs: `outputs/api*/<job_id>/` containing `sample_NN_<style>.mp4`, matching `.json`, per-control videos `..._control_edge.mp4`, and `job.log` / `metrics.log` (server-wide: `server.log`).
+- Engine/ClearML jobs: `outputs/clearml/<task_id>/episode_NNN/` containing `sample_NN_<style>.mp4`, matching `.json`, per-control videos `..._control_edge.mp4`, and `manifest.json`.
 - Experiment scripts: `outputs/tictactoe/<experiment>/` with a per-run `.log`.
 - **Control videos are cached and reused across style samples** — don't regenerate them unnecessarily.
 
