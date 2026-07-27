@@ -1,3 +1,33 @@
+# ⚠️ This is a modified fork of NVIDIA Cosmos-Transfer2.5
+
+This repository is a **fork** of [`nvidia-cosmos/cosmos-transfer2.5`](https://github.com/nvidia-cosmos/cosmos-transfer2.5), extended for a **domain-randomized robot data-augmentation** workflow (the tic-tac-toe project). The upstream NVIDIA README follows below unchanged. Everything in this section describes what **this fork adds or changes** on top of upstream.
+
+## What this fork adds
+
+1. **In-process restyling engine (`cosmos_transfer2/api/`).** Turns one input video + controls into **N domain-randomization style variations** of the same action. The checkpoint loads once and the control video is generated once and reused across all style samples. It is called **in-process — there is no HTTP server, port, or container.** Production runs are driven by a **ClearML Task** (`scripts/clearml_task.py`). Key modules: `engine.py` (`InferenceEngine`), `config_models.py` (`GenerateRequest` / `DualViewRequest` + `CONTROL_PRESETS`), `styles.yaml`, `views.yaml`, `upsampler.py`, `video_ops.py`.
+   - *History note:* an earlier version of this fork shipped an HTTP/Docker API (`server.py`, `Dockerfile.api`, `docker-compose.yml`). That layer was **removed** in favor of the direct-engine + ClearML approach — see `ENGINE_GUIDE.md`.
+
+2. **Tic-tac-toe project.** Assets under `assets/tictactoe/` (control specs, prompts, style references), plus driver scripts:
+   - `scripts/run_tictactoe_unified.py` — unified dual-view (top+wrist stacked) restyling runner.
+   - `scripts/run_outdoor_180.py` — resumable batch of `outdoor_shade` restyling across all 180 episodes.
+   - `scripts/exp_run_batch.py`, `scripts/exp_report.py`, `scripts/exp_pareto.py` — experiment harness for sweeping generation params and reporting time/VRAM/realism trade-offs. Findings are written up in `RESULTS.md`.
+
+3. **Runtime fixes to the vendored engine (`cosmos_transfer2/_src/`).** Small, targeted patches needed to run on this hardware/stack — notably an NVENC bitrate fix for Blackwell, plus tweaks to the depth, SAM2, and edge auxiliary pipelines and the checkpoint DB. The `_src/` tree is otherwise treated as an unmodified upstream dependency.
+
+4. **Project documentation.** [`CLAUDE.md`](CLAUDE.md) (architecture + working conventions) and [`ENGINE_GUIDE.md`](ENGINE_GUIDE.md) (full request schema, control presets, env vars). Environment is managed with **`uv`** + a **`justfile`** (`just install cu128`, `just run <cmd>`).
+
+## Quick start (fork workflow)
+
+```bash
+just install cu128                                   # or cu130 on Blackwell / aarch64
+uv pip install clearml && clearml-init               # one-time, for tracked runs
+uv run --no-sync python scripts/clearml_task.py      # edit PARAMS at top of file first
+```
+
+See `ENGINE_GUIDE.md` for details. Everything below is the original upstream NVIDIA documentation.
+
+---
+
 <p align="center">
     <img src="https://github.com/user-attachments/assets/28f2d612-bbd6-44a3-8795-833d05e9f05f" width="274" alt="NVIDIA Cosmos"/>
 </p>
