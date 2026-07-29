@@ -1,57 +1,53 @@
-# ⚠️ This is a modified fork of NVIDIA Cosmos-Transfer2.5
+# Dell Synthetic Data Generation
 
-This repository is a **fork** of [`nvidia-cosmos/cosmos-transfer2.5`](https://github.com/nvidia-cosmos/cosmos-transfer2.5), extended for a **domain-randomized robot data-augmentation** workflow (the tic-tac-toe project). The upstream NVIDIA README follows below unchanged. Everything in this section describes what **this fork adds or changes** on top of upstream.
+A fork of [NVIDIA Cosmos-Transfer2.5](https://github.com/nvidia-cosmos/cosmos-transfer2.5) used to generate synthetic training data for robot manipulation. Given a recorded episode, it produces several restyled versions of the same motion, changing lighting, materials, and camera appearance while keeping the geometry and action fixed. The variations serve as domain-randomized augmentations for downstream vision models.
 
-## What this fork adds
+The original NVIDIA documentation is preserved further down. The sections below cover how to install the project, how to run a generation job, and what this fork changes relative to upstream.
 
-1. **In-process restyling engine (`cosmos_transfer2/api/`).** Turns one input video + controls into **N domain-randomization style variations** of the same action. The checkpoint loads once and the control video is generated once and reused across all style samples. It is called **in-process — there is no HTTP server, port, or container.** Production runs are driven by a **ClearML Task** (`scripts/clearml_task.py`). Key modules: `engine.py` (`InferenceEngine`), `config_models.py` (`GenerateRequest` / `DualViewRequest` + `CONTROL_PRESETS`), `styles.yaml`, `views.yaml`, `upsampler.py`, `video_ops.py`.
+## Installation
 
-2. **Tic-tac-toe project.** Assets under `assets/tictactoe/` (control specs, prompts, style references), plus driver scripts:
-   - `scripts/run_tictactoe_unified.py` — unified dual-view (top+wrist stacked) restyling runner.
-   - `scripts/run_outdoor_180.py` — resumable batch of `outdoor_shade` restyling across all 180 episodes.
-   - `scripts/exp_run_batch.py`, `scripts/exp_report.py`, `scripts/exp_pareto.py` — experiment harness for sweeping generation params and reporting time/VRAM/realism trade-offs. Findings are written up in `RESULTS.md`.
+You will need an NVIDIA GPU, [`uv`](https://docs.astral.sh/uv/), and [`just`](https://github.com/casey/just).
 
-3. **Runtime fixes to the vendored engine (`cosmos_transfer2/_src/`).** Small, targeted patches needed to run on this hardware/stack — notably an NVENC bitrate fix for Blackwell, plus tweaks to the depth, SAM2, and edge auxiliary pipelines and the checkpoint DB. The `_src/` tree is otherwise treated as an unmodified upstream dependency.
-
-4. **Project documentation.** [`CLAUDE.md`](CLAUDE.md) (architecture + working conventions) and [`ENGINE_GUIDE.md`](ENGINE_GUIDE.md) (full request schema, control presets, env vars). Environment is managed with **`uv`** + a **`justfile`**.
-
-## Setup
-
-Prerequisites: an NVIDIA GPU with a recent driver, [`uv`](https://docs.astral.sh/uv/), and [`just`](https://github.com/casey/just). The 2B checkpoints auto-download from HuggingFace into your local cache on first use (multi-GB) — don't re-download or wipe them.
+Install the project with `just`, which creates a local `.venv` on Python 3.10 and installs the matching CUDA build:
 
 ```bash
-# 1. Install the environment (creates .venv, Python 3.10). Pick the CUDA build:
-just install cu128        # x86_64 / most GPUs
-just install cu130        # Blackwell / DGX Spark / aarch64
-
-# 2. (Only if checkpoints aren't already cached) export a HuggingFace token:
-export HF_TOKEN=hf_...
-#    Optionally point the cache at a large disk:
-export HF_HOME=/mnt/hf-cache
-
-# 3. (Only for tracked ClearML runs) install ClearML and configure credentials once:
-uv pip install clearml
-clearml-init              # writes ~/clearml.conf
-
-# 4. (Optional) enable LLM prompt upsampling:
-export ANTHROPIC_API_KEY=sk-ant-...
+just install cu128     # x86_64 and most GPUs
+just install cu130     # Blackwell, DGX Spark, or aarch64
 ```
 
-Run anything inside the environment with `just run <cmd>` (syncs first) or `uv run --no-sync <cmd>` (faster, no sync). **Never** `pip install` into the system Python or call bare `python`. Check `nvidia-smi` before launching — the GPU is shared.
+The 2B checkpoints download from Hugging Face on first use and are cached locally. If they are not already present, provide a token, and optionally point the cache at a larger disk:
 
-## Usage
+```bash
+export HF_TOKEN=hf_...
+export HF_HOME=/mnt/hf-cache     # optional
+```
 
-The engine restyles one input video into **N style variations** that share the same geometry/motion (fixed by the controls) but vary lighting, materials, and sensor look (driven by per-style prompt suffixes). Three ways to drive it:
+Generation runs are tracked in ClearML. Install it and configure credentials once:
 
-**A. Batch runs via ClearML (production path).** Edit the `PARAMS` dict at the top of `scripts/clearml_task.py` (episode list, prompt, styles, steps, control preset, `dual_view`), then:
+```bash
+uv pip install clearml
+clearml-init                     # writes ~/clearml.conf
+```
+
+Optional prompt upsampling through an LLM is off by default; set `ANTHROPIC_API_KEY` to enable it.
+
+Always run inside the managed environment, using either `just run <cmd>` or `uv run --no-sync <cmd>`. Do not install packages into the system Python or invoke `python` directly. Check `nvidia-smi` before starting a job, since the GPU is shared.
+
+## Running a job
+
+A job takes one input video and produces several style variations of it. The controls (edge, depth, segmentation, and blur) hold the scene geometry and motion in place, while a per-style prompt suffix changes the appearance. The checkpoint is loaded once and the control pass is computed once, then reused across every style.
+
+### With ClearML
+
+`scripts/clearml_task.py` is the main entry point. Edit the `PARAMS` block at the top of the file to set the episode list, prompt, styles, step count, and control preset, then run:
 
 ```bash
 uv run --no-sync python scripts/clearml_task.py
 ```
 
-The model loads once and is reused across every episode. The run is tracked in the ClearML GUI under project **"Cosmos Transfer"** — console logs, per-sample timing scalars, and each output video inline. Every `PARAMS` field is `task.connect`-ed, so you can override them from the GUI when cloning/enqueuing.
+The run appears in the ClearML web UI under the **Cosmos Transfer** project, with console output, per-sample timing, and each output video shown inline. Every parameter is registered with the task, so you can also override it from the UI when cloning or queuing a run. Because a whole episode list is processed in a single task, the checkpoint loads only once for the entire batch.
 
-**B. Programmatic use.** Build a `GenerateRequest` and hand it to a reused `InferenceEngine`:
+### From Python
 
 ```python
 from pathlib import Path
@@ -61,36 +57,46 @@ from cosmos_transfer2.api.engine import InferenceEngine
 req = GenerateRequest(
     prompt="A robot arm places a wooden block on the table.",
     video_path="/data/episode_000001.mp4",
-    styles=["warm_indoor", "cool_daylight"],   # length sets the number of variations
-    control_preset="balanced",                 # depth + seg + edge
+    styles=["warm_indoor", "cool_daylight"],
+    control_preset="balanced",
 )
-engine = InferenceEngine(work_dir=Path("outputs/_work"))   # checkpoint loads once
+
+engine = InferenceEngine(work_dir=Path("outputs/_work"))
 engine.run_job(req, Path(req.video_path), job_dir=Path("outputs/job01"))
 ```
 
-The smallest valid request is just `{"prompt": ..., "video_path": ...}`; every other field has a default. For top+wrist episodes use `engine.run_dual_view_job(req, top, wrist, job_dir)` with a `DualViewRequest` — both views ride one diffusion trajectory per style, so they stay frame-locked in colour/lighting.
+Only `prompt` and `video_path` are required; every other field has a default. Reuse a single `InferenceEngine` across jobs so the model stays resident in memory. Stacked top-and-wrist episodes go through `run_dual_view_job` with a `DualViewRequest`, which keeps both views locked to the same style.
 
-**C. Tic-tac-toe driver scripts.** `scripts/run_tictactoe_unified.py` (dual-view runner) and `scripts/run_outdoor_180.py` (resumable 180-episode batch) show end-to-end usage against the assets in `assets/tictactoe/`.
+### Common parameters
 
-### Key knobs
-
-| Knob | Default | Effect |
-|------|---------|--------|
-| `styles` / `num_samples` | `4` | Number of style variations (a `styles` list overrides the count). |
-| `num_steps` | `15` | Diffusion steps — ~6 for smoke tests, ~35 for production. |
-| `sigma_max` | `110` | **Main fidelity↔freedom knob** (0–200); higher = more restyle + more hallucination. Prefer tuning this over `guidance`. |
-| `guidance` | `5` | CFG strength (0–7); higher = stricter prompt adherence. |
-| `control_preset` | `balanced` | `balanced` (depth+seg+edge), `multicontrol_robot` (adds a vis colour anchor), or `edge` (fast, single control). |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `styles` | *(list)* | Styles to generate; the length of the list sets the number of variations. |
+| `num_steps` | `15` | Diffusion steps. Around 6 for quick tests, 35 for final quality. |
+| `sigma_max` | `110` | Primary fidelity/freedom control (0–200). Higher values restyle more aggressively. |
+| `guidance` | `5` | Classifier-free guidance strength (0–7). Higher values follow the prompt more closely. |
+| `control_preset` | `balanced` | `balanced` (depth, segmentation, edge), `multicontrol_robot` (adds a colour anchor), or `edge` (single, fast control). |
 | `resolution` | `720` | Output resolution. |
-| `guided_generation` | `False` | Anchor a foreground object (e.g. the robot arm) while restyling the rest. |
+| `guided_generation` | `False` | Holds a foreground object such as the robot arm fixed while the background is restyled. |
 
-Bundled styles (`cosmos_transfer2/api/styles.yaml`): `warm_indoor`, `cool_daylight`, `dim_evening`, `bright_overhead`, `wooden_table`, `white_lab`, `metallic_surface`, `overcast_window`, `tungsten_lamp`, `outdoor_shade`. Bundled views (`views.yaml`): `wrist`, `top`, `front`, `side`, `default`.
+The bundled styles are defined in `cosmos_transfer2/api/styles.yaml` (`warm_indoor`, `cool_daylight`, `dim_evening`, `bright_overhead`, `wooden_table`, `white_lab`, `metallic_surface`, `overcast_window`, `tungsten_lamp`, `outdoor_shade`) and the camera views in `views.yaml` (`wrist`, `top`, `front`, `side`, `default`).
 
-Each job writes `sample_NN_<style>.mp4`, the per-modality control videos `sample_NN_<style>_control_<key>.mp4`, and a `manifest.json` (full request, prompts, controls, per-sample timing) into its `job_dir`. **See [`ENGINE_GUIDE.md`](ENGINE_GUIDE.md) for the full request schema, control presets, and all environment variables.**
+### Output
+
+Each job writes into its own directory: one `sample_NN_<style>.mp4` per variation, the control videos used to produce them, and a `manifest.json` recording the request, resolved prompts, and per-sample timing. See [`ENGINE_GUIDE.md`](ENGINE_GUIDE.md) for the full request schema and the complete list of environment variables.
+
+## What this fork changes
+
+Wherever possible the upstream engine is used unmodified. The additions are:
+
+- **Restyling engine** (`cosmos_transfer2/api/`) — a library around the Cosmos inference pipeline that produces several domain-randomized variations from a single episode. It runs in-process, with no server or container, and is driven by ClearML. The main modules are `engine.py` (`InferenceEngine`), `config_models.py` (the request schema and control presets), `styles.yaml`, and `views.yaml`.
+- **Tic-tac-toe dataset work** — the assets in `assets/tictactoe/` (control specs, prompts, style references) together with the driver scripts `scripts/run_tictactoe_unified.py` (dual-view runner) and `scripts/run_outdoor_180.py` (resumable 180-episode batch). The experiment harness (`scripts/exp_run_batch.py`, `exp_report.py`, `exp_pareto.py`) sweeps generation parameters and reports the time, memory, and realism trade-offs written up in `RESULTS.md`.
+- **Hardware fixes** in the vendored engine (`cosmos_transfer2/_src/`) — small patches needed to run on this stack, notably an NVENC bitrate fix for Blackwell and adjustments to the depth, SAM2, and edge auxiliary pipelines. The rest of `_src/` is treated as an unmodified upstream dependency.
+- **Documentation** — [`CLAUDE.md`](CLAUDE.md) for architecture and working conventions, and [`ENGINE_GUIDE.md`](ENGINE_GUIDE.md) for the request schema, control presets, and environment variables. The environment is managed with `uv` and a `justfile`.
 
 ---
 
-*Everything below is the original upstream NVIDIA documentation.*
+The original NVIDIA Cosmos-Transfer2.5 README follows.
 
 ---
 
